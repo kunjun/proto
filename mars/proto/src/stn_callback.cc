@@ -28,12 +28,20 @@
 #include "mars/proto/src/DB2.h"
 #include <sstream>
 #include <map>
+#include <set>
 #include "mars/comm/http.h"
 #include "mars/app/app.h"
 #include "mars/app/app_logic.h"
 #include "mars/stn/stn.h"
 #include <sys/time.h>
 #include <time.h>
+#include <sys/types.h>
+
+#include "gzip/decompress.hpp"
+#include "gzip/utils.hpp"
+#include "gzip/version.hpp"
+
+#include <boost/lexical_cast.hpp>
 
 void (*shortlink_progress)(uint32_t task_id, uint32_t writed, uint32_t total) =
 [](uint32_t task_id, uint32_t writed, uint32_t total) {
@@ -197,17 +205,18 @@ void StnCallBack::onPullMsgSuccess(std::list<TMessage> messageList, int64_t curr
         currentChatroomHead = current;
     }
     MessageDB::Instance()->UpdateMessageTimeline(current);
-    PullMessage(head, pullType, false, refreshSetting);
     
     if(m_receiveMessageCB) {
         m_receiveMessageCB->onReceiveMessage(messageList, head > current);
     }
+    
+    PullMessage(head, pullType, false, refreshSetting);
 }
-void StnCallBack::onPullMsgFailure(int errorCode, int pullType) {
+void StnCallBack::onPullMsgFailure(int errorCode, int pullType, bool refreshSetting) {
     if (pullType != Pull_ChatRoom) {
         isPullingMsg = false;
         pullRetryCount++;
-        PullMessage(0x7FFFFFFFFFFFFFFF, pullType, true, false);
+        PullMessage(0x7FFFFFFFFFFFFFFF, pullType, true, refreshSetting);
     } else {
         isPullingChatroomMsg = false;
     }
@@ -229,6 +238,7 @@ void StnCallBack::onPullMsgFailure(int errorCode, int pullType) {
             tmsg.content.remoteMediaUrl = pmsg.content.remoteMediaUrl;
             tmsg.content.mentionedType = pmsg.content.mentionedType;
             tmsg.content.mentionedTargets = pmsg.content.mentionedTargets;
+            tmsg.content.extra = pmsg.content.extra;
             
             tmsg.from = pmsg.fromUser;
             tmsg.to = pmsg.tos;
@@ -257,6 +267,22 @@ void StnCallBack::onPullMsgFailure(int errorCode, int pullType) {
             }
             
             if (saveToDb) {
+                if (tmsg.content.type == 80) {
+                    int64_t messageUid = boost::lexical_cast<int64_t>(tmsg.content.binaryContent);
+                    
+                    TMessage tOldMsg = MessageDB::Instance()->GetMessageByUid(messageUid);
+                    if(tOldMsg.messageId > 0) {
+                        
+                        tmsg.messageId = tOldMsg.messageId;
+                        MessageDB::Instance()->UpdateMessageContent(tmsg.messageId, tmsg.content);
+                        
+                        if(m_receiveMessageCB) {
+                            m_receiveMessageCB->onRecallMessage(tmsg.from, messageUid);
+                        }
+                        return;
+                    }
+                }
+                
                 long id = MessageDB::Instance()->InsertMessage(tmsg);
                 tmsg.messageId = id;
                 
@@ -284,54 +310,81 @@ void StnCallBack::onPullMsgFailure(int errorCode, int pullType) {
                     if (result.messages.size() > 100 && mPullType != Pull_ChatRoom) {
                         isBegin = DB2::Instance()->BEGIN();
                     }
+                    std::set<std::string> needUpdateGroup;
+                    std::set<std::string> needUpdateGroupMember;
                     for (std::list<Message>::iterator it = result.messages.begin(); it != result.messages.end(); it++) {
                         TMessage tmsg;
                         StnCallBack::Instance()->converProtoMessage(*it, tmsg, true, curUser);
                         messageList.push_back(tmsg);
                         
-//                        #define MESSAGE_CONTENT_TYPE_CREATE_GROUP 104
-//                        #define MESSAGE_CONTENT_TYPE_ADD_GROUP_MEMBER 105
-//                        #define MESSAGE_CONTENT_TYPE_KICKOF_GROUP_MEMBER 106
-//                        #define MESSAGE_CONTENT_TYPE_QUIT_GROUP 107
-//                        #define MESSAGE_CONTENT_TYPE_DISMISS_GROUP 108
-//                        #define MESSAGE_CONTENT_TYPE_TRANSFER_GROUP_OWNER 109
+//#define MESSAGE_CONTENT_TYPE_CREATE_GROUP 104
+//#define MESSAGE_CONTENT_TYPE_ADD_GROUP_MEMBER 105
+//#define MESSAGE_CONTENT_TYPE_KICKOF_GROUP_MEMBER 106
+//#define MESSAGE_CONTENT_TYPE_QUIT_GROUP 107
+//#define MESSAGE_CONTENT_TYPE_DISMISS_GROUP 108
+//#define MESSAGE_CONTENT_TYPE_TRANSFER_GROUP_OWNER 109
+//
 //#define MESSAGE_CONTENT_TYPE_CHANGE_GROUP_NAME 110
 //#define MESSAGE_CONTENT_TYPE_MODIFY_GROUP_ALIAS 111
 //#define MESSAGE_CONTENT_TYPE_CHANGE_GROUP_PORTRAIT 112
+//
+//#define MESSAGE_CONTENT_TYPE_CHANGE_MUTE 113
+//#define MESSAGE_CONTENT_TYPE_CHANGE_JOINTYPE 114
+//#define MESSAGE_CONTENT_TYPE_CHANGE_PRIVATECHAT 115
+//#define MESSAGE_CONTENT_TYPE_CHANGE_SEARCHABLE 116
+//#define MESSAGE_CONTENT_TYPE_SET_MANAGER 117
+
                         if (tmsg.conversationType == 1) {
                             if (tmsg.content.type == MESSAGE_CONTENT_TYPE_CREATE_GROUP
                                 || tmsg.content.type == MESSAGE_CONTENT_TYPE_ADD_GROUP_MEMBER
                                 || tmsg.content.type == MESSAGE_CONTENT_TYPE_KICKOF_GROUP_MEMBER
                                 || tmsg.content.type == MESSAGE_CONTENT_TYPE_TRANSFER_GROUP_OWNER
                                 || tmsg.content.type == MESSAGE_CONTENT_TYPE_MODIFY_GROUP_ALIAS) {
-                                MessageDB::Instance()->GetGroupInfo(tmsg.target, true);
-                                MessageDB::Instance()->GetGroupMembers(tmsg.target, true);
-                            } else if (tmsg.content.type == MESSAGE_CONTENT_TYPE_CHANGE_GROUP_NAME
-                                       || tmsg.content.type == MESSAGE_CONTENT_TYPE_CHANGE_GROUP_PORTRAIT) {
-                                MessageDB::Instance()->GetGroupInfo(tmsg.target, true);
-                            } else if (tmsg.content.type == MESSAGE_CONTENT_TYPE_QUIT_GROUP
-                                       || tmsg.content.type == MESSAGE_CONTENT_TYPE_DISMISS_GROUP) {
+                                needUpdateGroup.insert(tmsg.target);
+                                needUpdateGroupMember.insert(tmsg.target);
+                            } else if(tmsg.content.type == MESSAGE_CONTENT_TYPE_SET_MANAGER) {
+                                needUpdateGroupMember.insert(tmsg.target);
+                            } else  if (tmsg.content.type == MESSAGE_CONTENT_TYPE_CHANGE_GROUP_NAME
+                                       || tmsg.content.type == MESSAGE_CONTENT_TYPE_CHANGE_GROUP_PORTRAIT
+                                       || tmsg.content.type == MESSAGE_CONTENT_TYPE_CHANGE_MUTE
+                                       || tmsg.content.type == MESSAGE_CONTENT_TYPE_CHANGE_JOINTYPE
+                                       || tmsg.content.type == MESSAGE_CONTENT_TYPE_CHANGE_PRIVATECHAT
+                                       || tmsg.content.type == MESSAGE_CONTENT_TYPE_CHANGE_SEARCHABLE) {
+                                needUpdateGroup.insert(tmsg.target);
+                            } else if (tmsg.content.type == MESSAGE_CONTENT_TYPE_QUIT_GROUP) {
+                                if (tmsg.from == curUser) {
+                                    MessageDB::Instance()->RemoveGroupAndMember(tmsg.target);
+                                    MessageDB::Instance()->ClearUnreadStatus(tmsg.conversationType, tmsg.target, tmsg.line);
+                                    MessageDB::Instance()->RemoveConversation(tmsg.conversationType, tmsg.target, tmsg.line);
+                                }
+                            } else if (tmsg.content.type == MESSAGE_CONTENT_TYPE_DISMISS_GROUP) {
                                 MessageDB::Instance()->RemoveGroupAndMember(tmsg.target);
                                 MessageDB::Instance()->ClearUnreadStatus(tmsg.conversationType, tmsg.target, tmsg.line);
                                 MessageDB::Instance()->RemoveConversation(tmsg.conversationType, tmsg.target, tmsg.line);
                             }
                         }
                     }
+                    
+                    for (std::set<std::string>::iterator it = needUpdateGroup.begin(); it != needUpdateGroup.end(); it++) {
+                        MessageDB::Instance()->GetGroupInfo(*it, true);
+                    }
+                    
+                    for (std::set<std::string>::iterator it = needUpdateGroupMember.begin(); it != needUpdateGroupMember.end(); it++) {
+                        MessageDB::Instance()->GetGroupMembers(*it, true);
+                    }
+                    
                     if(isBegin) {
                         DB2::Instance()->COMMIT();
                     }
                     
                     cb->onPullMsgSuccess(messageList, result.current, result.head, mPullType, mRefreshSetting);
-                    if (mRefreshSetting) {
-                        StnCallBack::Instance()->PullSetting(0x7FFFFFFFFFFFFFFF);
-                    }
                 } else {
-                    cb->onPullMsgFailure(-1, mPullType);
+                    cb->onPullMsgFailure(-1, mPullType, mRefreshSetting);
                 }
                 delete this;
             };
             void onFalure(int errorCode) {
-                cb->onPullMsgFailure(errorCode, mPullType);
+                cb->onPullMsgFailure(errorCode, mPullType, mRefreshSetting);
                 delete this;
             };
             virtual ~PullingMessagePublishCallback() {
@@ -347,6 +400,9 @@ void StnCallBack::PullMessage(int64_t head, int type, bool retry, bool refreshSe
         if (isPullingMsg || currentHead >= head) {
             if (currentHead >= head && m_connectionStatus != kConnectionStatusConnected) {
                 updateConnectionStatus(kConnectionStatusConnected);
+                if (refreshSetting) {
+                    StnCallBack::Instance()->PullSetting(0x7FFFFFFFFFFFFFFF);
+                }
             }
             return;
         }
@@ -641,16 +697,24 @@ int StnCallBack::Buf2Resp(uint32_t _taskid, void* const _user_context, const Aut
       xinfo2(TSF"PROTO -> TASK(%0) has response", task->description());
       xinfo2(TSF"PROTO -> TASK errorcode:%0", _error_code);
     const MQTTPublishTask *publishTask = (const MQTTPublishTask *)_user_context;
-      if (_error_code == 0) {
+      if (_error_code == 0 || _error_code == 255) {
           if (_inbuffer.Length() < 1) {
               if(publishTask->m_callback)
                   publishTask->m_callback->onFalure(kEcProtoCorruptData);
           } else {
               unsigned char *p = (unsigned char *)_inbuffer.Ptr();
               xinfo2(TSF"PROTO -> TASK business code:%0(0success, otherwise failure)", *p);
-              if (*p == 0) {
+              if (*p == 0 || *p == 255) {
+                  if (*p == 255) {
+                      unsigned char *pData = (unsigned char *)(_inbuffer.Ptr()) + 1;
+                      unsigned int length = (unsigned int)(_inbuffer.Length()-1);
+                      std::string strData = gzip::decompress((char*)pData, length, NULL);
+                      if(publishTask->m_callback)
+                          publishTask->m_callback->onSuccess((const unsigned char *)strData.c_str(), strData.length());
+                  } else {
                   if(publishTask->m_callback)
-                  publishTask->m_callback->onSuccess((const unsigned char *)(_inbuffer.Ptr()) + 1, (unsigned int)(_inbuffer.Length()-1));
+                      publishTask->m_callback->onSuccess((const unsigned char *)(_inbuffer.Ptr()) + 1, (unsigned int)(_inbuffer.Length()-1));
+                  }
               } else {
                   if(publishTask->m_callback)
                       publishTask->m_callback->onFalure(*p);

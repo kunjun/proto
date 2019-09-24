@@ -50,6 +50,11 @@ namespace mars {
             bool ClearMessages(int conversationType, const std::string &target, int line);
             
             std::list<TMessage> GetMessages(int conversationType, const std::string &target, int line, const std::list<int> &contentTypes, bool desc, int count, long startPoint, const std::string &withUser);
+            
+            std::list<TMessage> GetMessages(const std::list<int> &conversationTypes, const std::list<int> &lines, const std::list<int> &contentTypes, bool desc, int count, long startPoint, const std::string &withUser);
+            
+            std::list<TMessage> GetMessages(const std::list<int> &conversationTypes, const std::list<int> &lines, const int messageStatus, bool desc, int count, long startPoint, const std::string &withUser);
+
           
             TMessage GetMessageById(long messageId);
             TMessage GetMessageByUid(long long messageUid);
@@ -65,6 +70,7 @@ namespace mars {
             
             TUnreadCount GetUnreadCount(const std::list<int> &conversationTypes, const std::list<int> lines);
             bool ClearUnreadStatus(int conversationType, const std::string &target, int line);
+            bool ClearUnreadStatus(const std::list<int> &conversationTypes, const std::list<int> lines);
             bool ClearAllUnreadStatus();
             
             bool FailSendingMessages();
@@ -105,6 +111,8 @@ namespace mars {
             std::list<TFriendRequest> getFriendRequest(int direction);
             
             long InsertFriendOrReplace(const std::string &friendUid, int state, int64_t timestamp, const std::string &alias);
+            
+            bool DeleteFriend(const std::string &friendUid);
             
             int unreadFriendRequest();
             void clearUnreadFriendRequestStatus();

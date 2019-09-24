@@ -31,6 +31,7 @@
 #include "mars/proto/src/Proto/dismiss_group_request.h"
 #include "mars/proto/src/Proto/modify_group_alias.h"
 #include "mars/proto/src/Proto/modify_group_info.h"
+#include "mars/proto/src/Proto/set_group_manager.h"
 #include "mars/proto/src/Proto/id_buf.h"
 #include "mars/proto/src/Proto/int64_buf.h"
 #include "mars/proto/src/Proto/id_list_buf.h"
@@ -73,6 +74,7 @@
 #include "mars/app/app.h"
 #include <iostream>
 #include "comm/crypt/ibase64.h"
+#include "mars/comm/xlogger/xlogger.h"
 
 #if WFCHAT_PROTO_SERIALIZABLE
 #include "rapidjson/rapidjson.h"
@@ -108,6 +110,7 @@ const std::string getGroupInfoTopic = "GPGI";
 const std::string getUserInfoTopic = "UPUI";
 const std::string getGroupMemberTopic = "GPGM";
 const std::string transferGroupTopic = "GTG";
+const std::string setGroupManagerTopic = "GSM";
 const std::string getQiniuUploadTokenTopic = "GQNUT";
 const std::string modifyMyInfoTopic = "MMI";
 const std::string AddFriendRequestTopic = "FAR";
@@ -141,6 +144,8 @@ std::string g_chatroomId = "";
 
         static bool isRoutring = false;
 
+        static UserServerAddress GUS;
+        
 class BusinessRouteCallback : public MQTTPublishCallback {
 public:
     BusinessRouteCallback() : MQTTPublishCallback()  {}
@@ -159,12 +164,14 @@ public:
 
             gHost = response.host;
 
-            UserServerAddress us;
-            us.host = gHost;
-            us.longLinkPort = response.longPort;
-            us.shortLinkPort = response.shortPort;
+            
+            GUS.host = gHost;
+            GUS.longLinkPort = response.longPort;
+            GUS.shortLinkPort = response.shortPort;
+            GUS.thumbPara = response.thumbPara;
+            GUS.updateDt = (int64_t)time(NULL);
 
-            DB2::Instance()->UpdateUserServerAddress(gUserId, us);
+            DB2::Instance()->UpdateUserServerAddress(gUserId, GUS);
 
             MakesureLonglinkConnected();
             mars::baseevent::OnForeground(true);
@@ -263,6 +270,9 @@ public:
                 request.phoneName = deviceInfo.phonename;
                 request.platform = deviceInfo.platform;
                 request.pushType = deviceInfo.pushtype;
+                if(request.pushType >= 16) {
+                    request.pushType = 0; //protect code.
+                }
                 request.appversion = deviceInfo.appversion;
                 request.sdkversion = deviceInfo.sdkversion;
 
@@ -272,36 +282,40 @@ public:
 
         }
 
-void (*Connect)(const std::string& host, uint16_t shortLinkPort)
-= [](const std::string& host, uint16_t shortLinkPort) {
+bool Connect(const std::string& host, uint16_t shortLinkPort) {
     gRouteHost = host;
     gRoutePort = shortLinkPort;
 
     NetSource::SetShortlink(shortLinkPort, "");
 
-    UserServerAddress us = DB2::Instance()->GetUserServerAddress(gUserId);
-    if(!us.host.empty() && us.longLinkPort > 0 && us.shortLinkPort > 0) {
+    GUS = DB2::Instance()->GetUserServerAddress(gUserId);
+    if(!GUS.host.empty() && GUS.longLinkPort > 0 && GUS.shortLinkPort > 0) {
         std::vector<std::string> hosts;
-        hosts.push_back(us.host);
+        hosts.push_back(GUS.host);
         StnCallBack::Instance()->mAuthed = true;
         std::vector<uint16_t> longLinkPorts;
-        longLinkPorts.push_back(us.longLinkPort);
+        longLinkPorts.push_back(GUS.longLinkPort);
 
-        NetSource::SetShortlink(us.shortLinkPort, "");
+        NetSource::SetShortlink(GUS.shortLinkPort, "");
         NetSource::SetLongLink(hosts, longLinkPorts, "");
-        gHost = us.host;
+        gHost = GUS.host;
 
         MakesureLonglinkConnected();
 
         //首次连接如果离上次route超过1小时，强制刷新route信息。
         //在前后台切换或者网络切换时，超过12小时，强制刷新route信息。
         //你问我为啥是这个值，我也不知道！！！
-        if(((int64_t)time(NULL) - us.updateDt) > 3600) {
+        if(((int64_t)time(NULL) - GUS.updateDt) > 3600) {
             RequestRoute(true);
         }
     }
 
     mars::baseevent::OnForeground(true);
+    if (DB2::Instance()->newCreatedDB) {
+        DB2::Instance()->newCreatedDB = false;
+        return true;
+    }
+    return false;
 };
 
 class GeneralOperationPublishCallback : public MQTTPublishCallback {
@@ -323,6 +337,27 @@ public:
     }
 };
 
+        class DeleteFriendPublishCallback : public MQTTPublishCallback {
+        public:
+            DeleteFriendPublishCallback(GeneralOperationCallback *cb, const std::string &fid) : MQTTPublishCallback(), callback(cb), friendUid(fid) {}
+            GeneralOperationCallback *callback;
+            std::string friendUid;
+            void onSuccess(const unsigned char* data, size_t len) {
+                mars::stn::MessageDB::Instance()->DeleteFriend(friendUid);
+                if(callback)
+                    callback->onSuccess();
+                delete this;
+            };
+            void onFalure(int errorCode) {
+                if(callback)
+                    callback->onFalure(errorCode);
+                delete this;
+            };
+            virtual ~DeleteFriendPublishCallback() {
+                
+            }
+        };
+        
         class RecallMessagePublishCallback : public MQTTPublishCallback {
         public:
             RecallMessagePublishCallback(GeneralOperationCallback *cb, long long messageUid) : MQTTPublishCallback(), callback(cb), uid(messageUid) {}
@@ -619,6 +654,7 @@ void fillMessageContent(TMessageContent &tcontent, MessageContent *content, int 
     content->mentionedTargets = tcontent.mentionedTargets;
     content->expireDuration = expireDuration;
     content->persistFlag = MessageDB::Instance()->getMessageFlag(content->type);
+    content->extra = tcontent.extra;
 }
 
 void fillConversation(TMessage &tmsg, Conversation *conversation) {
@@ -739,17 +775,23 @@ int (*sendMessage)(TMessage &tmsg, SendMsgCallback *callback, int expireDuration
 
         char * buffer;
         long size;
+#ifdef _WIN32
+		DWORD dwMinSize = ::MultiByteToWideChar(CP_UTF8, 0, tmsg.content.localMediaPath.c_str(), -1, NULL, 0);
+		wchar_t * wstrUnicoe = new wchar_t[dwMinSize];
+		wmemset(wstrUnicoe, 0, dwMinSize);
+		dwMinSize = ::MultiByteToWideChar(CP_UTF8, 0, tmsg.content.localMediaPath.c_str(), -1, wstrUnicoe, dwMinSize);
+		std::ifstream file(wstrUnicoe, std::ios::in | std::ios::binary | std::ios::ate);
+		free(wstrUnicoe);
+#else
         std::ifstream file (tmsg.content.localMediaPath.c_str(), std::ios::in|std::ios::binary|std::ios::ate);
+#endif
         size = file.tellg();
         file.seekg (0, std::ios::beg);
         buffer = new char [size];
         file.read (buffer, size);
         file.close();
-
         std::string md(buffer, size);
-
         delete [] buffer;
-
         mars::stn::MQTTPublishTask *publishTask = new mars::stn::MQTTPublishTask(new GetUploadTokenCallback(new UploadMediaForSendCallback(callback, tmsg, id, expireDuration), md));
         publishTask->topic = getQiniuUploadTokenTopic;
         publishTask->length = 1;
@@ -794,7 +836,8 @@ void recallMessage(long long messageUid, GeneralOperationCallback *callback) {
                     if(isBegin) {
                         DB2::Instance()->COMMIT();
                     }
-                    
+
+                    messageList.reverse();
                     cb->onSuccess(messageList);
                 } else {
                     cb->onSuccess(messageList);
@@ -1268,7 +1311,7 @@ void handleFriendRequest(const std::string &userId, bool accept, GeneralOperatio
 void deleteFriend(const std::string &userId, GeneralOperationCallback *callback) {
     IDBuf *request = new IDBuf();
     request->id = userId;
-    publishTask(request, new GeneralOperationPublishCallback(callback), DeleteFriendTopic, false);
+    publishTask(request, new DeleteFriendPublishCallback(callback, userId), DeleteFriendTopic, false);
 }
         
         void setFriendAlias(const std::string &userId, const std::string &alias, GeneralOperationCallback *callback) {
@@ -1285,11 +1328,11 @@ void blackListRequest(const std::string &userId, bool blacked, GeneralOperationC
     publishTask(request, new GeneralOperationPublishCallback(callback), BlackListUserTopic, false);
 }
 
-void (*createGroup)(const std::string &groupId, const std::string &groupName, const std::string &groupPortrait, const std::list<std::string> &groupMembers, const std::list<int> &notifyLines, TMessageContent &content, CreateGroupCallback *callback)
-= [](const std::string &groupId, const std::string &groupName, const std::string &groupPortrait, const std::list<std::string> &groupMembers, const std::list<int> &notifyLines, TMessageContent &content, CreateGroupCallback *callback) {
+void (*createGroup)(const std::string &groupId, const std::string &groupName, const std::string &groupPortrait, int groupType, const std::list<std::string> &groupMembers, const std::list<int> &notifyLines, TMessageContent &content, CreateGroupCallback *callback)
+= [](const std::string &groupId, const std::string &groupName, const std::string &groupPortrait, int groupType, const std::list<std::string> &groupMembers, const std::list<int> &notifyLines, TMessageContent &content, CreateGroupCallback *callback) {
     CreateGroupRequest *request = new CreateGroupRequest();
     request->group.groupInfo.targetId = groupId;
-    request->group.groupInfo.type = GroupType_Normal;
+    request->group.groupInfo.type = (GroupType)groupType;
     request->group.groupInfo.portrait = groupPortrait;
     request->group.groupInfo.name = groupName;
 
@@ -1398,6 +1441,10 @@ public:
                 tInfo.extra = info.extra;
                 tInfo.updateDt = info.updateDt;
                 tInfo.memberCount = info.memberCount;
+                tInfo.mute = info.mute;
+                tInfo.joinType = info.joinType;
+                tInfo.privateChat = info.privateChat;
+                tInfo.searchable = info.searchable;
                 retList.push_back(tInfo);
                 MessageDB::Instance()->InsertGroupInfo(tInfo);
             }
@@ -1530,7 +1577,24 @@ void (*transferGroup)(const std::string &groupId, const std::string &newOwner, c
 
     publishTask(request, new GeneralOperationPublishCallback(callback), transferGroupTopic, false);
 };
-
+        
+void SetGroupManager(const std::string &groupId, const std::list<std::string> userIds, int setOrDelete, const std::list<int> &notifyLines, TMessageContent &content, GeneralOperationCallback *callback) {
+    SetGroupManagerRequest *request = new SetGroupManagerRequest();
+    request->groupId = groupId;
+    request->type = setOrDelete;
+    
+    for(std::list<std::string>::const_iterator it = userIds.begin(); it != userIds.end(); it++) {
+        request->userIds.push_back(*it);
+    }
+    
+    for(std::list<int>::const_iterator it = notifyLines.begin(); it != notifyLines.end(); it++) {
+        request->toLines.push_back(*it);
+    }
+    
+    fillMessageContent(content, &(request->notifyContent));
+    publishTask(request, new GeneralOperationPublishCallback(callback), setGroupManagerTopic, false);
+        }
+        
 class GetUserInfoPublishCallback : public MQTTPublishCallback {
 public:
     GetUserInfoPublishCallback(GetUserInfoCallback *cb) : MQTTPublishCallback(), callback(cb) {}
@@ -1631,6 +1695,9 @@ void setDeviceToken(const std::string &appName, const std::string &deviceToken, 
     request->appName = appName;
     request->deviceToken = deviceToken;
     request->pushType = pushType;
+    if(request->pushType >= 16) {
+        request->pushType = 0; //protect code
+    }
 
     publishTask(request, new GeneralOperationPublishCallback(NULL), UploadDeviceTokenTopic, false);
 }
@@ -1777,14 +1844,20 @@ MQTTDisconnectTask::MQTTDisconnectTask() : MQTTTask(MQTT_MSG_DISCONNECT), flag(0
             free(tmp);
             return false;
         }
+
 bool setAuthInfo(const std::string &userId, const std::string &token) {
     if(!decodeToken(token, gToken, gSecret, gDbSecret)) {
         mars::stn::StnCallBack::Instance()->updateConnectionStatus(kConnectionStatusTokenIncorrect);
         return false;
     }
     mars::stn::SetCallback(StnCallBack::Instance());
-    DB2::Instance()->Open(gDbSecret);
-    DB2::Instance()->Upgrade();
+    DB2::Instance()->Open(gDbSecret, false);
+    
+    if(DB2::Instance()->Upgrade() == -1) {
+        DB2::Instance()->Open(gDbSecret, true);
+        DB2::Instance()->Upgrade();
+    }
+    
     MessageDB::Instance()->FailSendingMessages();
     StnCallBack::Instance()->onDBOpened();
     mqtt_init(mars::app::GetDeviceInfo().clientid.c_str());
@@ -2013,6 +2086,10 @@ void reloadChannelInfoFromRemote(const std::string &channelId, int64_t updateDt,
     request->head = updateDt;
     publishTask(request, new LoadChannelPublishCallback(callback), channelPullTopic, false);
 }
+        
+std::string GetImageThumbPara() {
+    return GUS.thumbPara;
+}
 
 #if WFCHAT_PROTO_SERIALIZABLE
         bool getValue(const Value &value, const std::string tag, int &ret) {
@@ -2180,6 +2257,8 @@ void reloadChannelInfoFromRemote(const std::string &channelId, int64_t updateDt,
 
 //            std::list<std::string> mentionedTargets;
             getValue(value, "mentionedTargets", mentionedTargets);
+            
+            getValue(value, "extra", extra);
         }
 
 
@@ -2237,6 +2316,9 @@ void reloadChannelInfoFromRemote(const std::string &channelId, int64_t updateDt,
             }
             writer.EndArray();
 
+            writer.String("extra");
+            writer.String(extra);
+            
             writer.EndObject();
         }
 
@@ -2351,6 +2433,11 @@ void reloadChannelInfoFromRemote(const std::string &channelId, int64_t updateDt,
             getValue(value, "extra", extra);
 //            int64_t updateDt;
             getValue(value, "updateDt", updateDt);
+            
+            getValue(value, "mute", mute);
+            getValue(value, "joinType", joinType);
+            getValue(value, "privateChat", privateChat);
+            getValue(value, "searchable", searchable);
         }
 
         void TGroupInfo::Serialize(void *pwriter) const {
@@ -2383,6 +2470,23 @@ void reloadChannelInfoFromRemote(const std::string &channelId, int64_t updateDt,
             writer.String("updateDt");
             writer.Int64(updateDt);
 
+            
+//            int mute;
+            writer.String("mute");
+            writer.Int(mute);
+            
+//            int joinType;
+            writer.String("joinType");
+            writer.Int(joinType);
+            
+//            int privateChat;
+            writer.String("privateChat");
+            writer.Int(privateChat);
+            
+//            int searchable;
+            writer.String("searchable");
+            writer.Int(searchable);
+            
             writer.EndObject();
         }
 
